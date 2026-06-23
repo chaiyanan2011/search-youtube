@@ -14,32 +14,54 @@ YT_HEADERS = {
 
 # ---------- Spotify ----------
 def get_spotify_token():
-    creds = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
-    r = requests.post('https://accounts.spotify.com/api/token',
-        headers={'Authorization': f'Basic {creds}'},
-        data={'grant_type': 'client_credentials'}, timeout=10)
-    return r.json().get('access_token')
+    try:
+        creds = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+        r = requests.post('https://accounts.spotify.com/api/token',
+            headers={'Authorization': f'Basic {creds}'},
+            data={'grant_type': 'client_credentials'}, timeout=10)
+        if r.status_code != 200:
+            return None
+        return r.json().get('access_token')
+    except Exception:
+        return None
 
 def get_audio_features(title, artist, token):
-    q = f"{title} {artist}".strip()
-    r = requests.get('https://api.spotify.com/v1/search',
-        headers={'Authorization': f'Bearer {token}'},
-        params={'q': q, 'type': 'track', 'limit': 1}, timeout=10)
-    items = r.json().get('tracks', {}).get('items', [])
-    if not items:
+    if not token:
         return None
-    track_id = items[0]['id']
-    r2 = requests.get(f'https://api.spotify.com/v1/audio-features/{track_id}',
-        headers={'Authorization': f'Bearer {token}'}, timeout=10)
-    f = r2.json()
-    return {
-        'energy':       f.get('energy', 0.5),
-        'valence':      f.get('valence', 0.5),
-        'danceability': f.get('danceability', 0.5),
-        'tempo':        min(f.get('tempo', 120) / 200, 1.0),
-        'acousticness': f.get('acousticness', 0.5),
-        'instrumentalness': f.get('instrumentalness', 0),
-    }
+        
+    q = f"{title} {artist}".strip()
+    try:
+        r = requests.get('https://api.spotify.com/v1/search',
+            headers={'Authorization': f'Bearer {token}'},
+            params={'q': q, 'type': 'track', 'limit': 1}, timeout=10)
+        
+        if r.status_code != 200:
+            return None
+            
+        data = r.json()
+        items = data.get('tracks', {}).get('items', [])
+        if not items:
+            return None
+            
+        track_id = items[0]['id']
+        r2 = requests.get(f'https://api.spotify.com/v1/audio-features/{track_id}',
+            headers={'Authorization': f'Bearer {token}'}, timeout=10)
+            
+        if r2.status_code != 200:
+            return None
+            
+        f = r2.json()
+        return {
+            'energy':       f.get('energy', 0.5),
+            'valence':      f.get('valence', 0.5),
+            'danceability': f.get('danceability', 0.5),
+            'tempo':        min(f.get('tempo', 120) / 200, 1.0),
+            'acousticness': f.get('acousticness', 0.5),
+            'instrumentalness': f.get('instrumentalness', 0),
+        }
+    except (requests.exceptions.RequestException, ValueError):
+        # หากเกิดปัญหา Network หรือ JSONDecodeError จะส่งค่ากลับเป็น None แทนการทำแอปพัง
+        return None
 
 def similarity(a, b):
     if not a or not b:
@@ -50,15 +72,15 @@ def similarity(a, b):
 
 # ---------- YouTube ----------
 def yt_search(q, limit=20):
-    r = requests.get('https://www.youtube.com/results',
-        params={'search_query': q, 'hl': 'th'},
-        headers=YT_HEADERS, timeout=10)
-    match = re.search(r'var ytInitialData\s*=\s*(\{.+?\});\s*</script>', r.text, re.DOTALL)
-    if not match:
-        return []
-    data = json.loads(match.group(1))
-    results = []
     try:
+        r = requests.get('https://www.youtube.com/results',
+            params={'search_query': q, 'hl': 'th'},
+            headers=YT_HEADERS, timeout=10)
+        match = re.search(r'var ytInitialData\s*=\s*(\{.+?\});\s*</script>', r.text, re.DOTALL)
+        if not match:
+            return []
+        data = json.loads(match.group(1))
+        results = []
         contents = (data['contents']['twoColumnSearchResultsRenderer']
                     ['primaryContents']['sectionListRenderer']
                     ['contents'][0]['itemSectionRenderer']['contents'])
@@ -82,8 +104,8 @@ def yt_search(q, limit=20):
             })
             if len(results) >= limit:
                 break
-    except:
-        pass
+    except Exception:
+        return []
     return results
 
 # ---------- Routes ----------
@@ -98,21 +120,19 @@ def search():
 
 @app.route('/autodj')
 def autodj():
-    """
-    รับ seed=ชื่อเพลงตั้งต้น, limit=จำนวนเพลงใน queue
-    วิเคราะห์ audio features แล้วเรียงเพลงตาม similarity
-    """
     seed  = request.args.get('seed', '').strip()
     limit = min(int(request.args.get('limit', 10)), 20)
     if not seed:
         return jsonify({'error': 'missing seed'}), 400
 
     token = get_spotify_token()
+    if not token:
+        return jsonify({'error': 'unable to authenticate with spotify mock server'}), 500
 
     # หา features ของเพลงตั้งต้น
     seed_videos = yt_search(seed, 1)
     if not seed_videos:
-        return jsonify({'error': 'seed not found'}), 404
+        return jsonify({'error': 'seed not found on youtube'}), 404
     seed_video = seed_videos[0]
     seed_feat  = get_audio_features(seed_video['title'], seed_video['channel'], token)
 
@@ -123,6 +143,11 @@ def autodj():
     scored = []
     for v in candidates:
         feat = get_audio_features(v['title'], v['channel'], token)
+        
+        # เพิ่มการตรวจสอบข้ามเพลงที่ไม่มีข้อมูล features ป้องกันโค้ดล่ม
+        if feat is None:
+            continue
+            
         sim  = similarity(seed_feat, feat)
         scored.append({**v, 'features': feat, 'similarity': sim})
 
